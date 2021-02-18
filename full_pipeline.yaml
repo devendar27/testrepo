@@ -1,0 +1,155 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger:
+- develop/AUTHSERVIC
+parameters:
+- name: docker
+  displayName: Build (CI - Includes helm chart creation)
+  type: boolean
+  default: true
+- name: deploy
+  displayName: Deploy (CD - Includes helm upgrade install)
+  type: boolean
+  default: true
+- name: dryrun
+  displayName: DryRun (CD - Works only with Deploy enabled)
+  type: boolean
+  default: false
+- name: install
+  displayName: DryRun & Install (CD - Works only with Deploy enabled)
+  type: boolean
+  default: true
+
+stages:
+- ${{ if eq(parameters.docker, true) }}:
+  - stage: MAVEN_CI_BUILD_STAGE
+    jobs:
+    - job: MAVEN_BUILD_TASKS_JOB
+      variables:
+        - group: kv-nprod
+        - name:  appname
+          value: fhirinterceptor 
+      # pool:
+      #   name: BuildPool
+      pool:
+        vmImage: 'ubuntu-latest'
+      # pool:
+      #     name: wba-hsd
+      #     demands: Agent.ComputerName -equals xxxxxxxxxxx
+      steps:
+        - task: CmdLine@2
+          inputs:
+            script: 'java -version'
+        - task: Maven@3
+          inputs:
+            mavenPomFile: 'pom.xml'
+            goals: 'clean package -Dmaven.skip.tests=true'
+            options: '-DfinalName=$(appname)-$(Build.BuildId)'
+            publishJUnitResults: false
+            sonarQubeRunAnalysis: false
+
+        # - task: CopyFiles@2
+        #   displayName: 'Copy Files to: $(build.artifactstagingdirectory)'
+        #   inputs:
+        #     SourceFolder: '$(system.defaultworkingdirectory)/target'
+        #     Contents: '*.jar'
+        #     TargetFolder: '$(build.artifactstagingdirectory)'
+        #   condition: succeededOrFailed()
+
+        # - task: PublishBuildArtifacts@1
+        #   inputs:
+        #     PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        #     ArtifactName: 'drop'
+        #     publishLocation: 'Container'
+        
+        - task: ArchiveFiles@2
+          displayName: Archive Application
+          inputs:
+            rootFolderOrFile: "$(System.DefaultWorkingDirectory)/target"
+            includeRootFolder: false
+            archiveType: "zip"
+            archiveFile: "$(System.DefaultWorkingDirectory)/target/$(Build.DefinitionName)-$(Build.BuildNumber).zip"
+            replaceExistingArchive: true
+
+        - task: PublishBuildArtifacts@1
+          inputs:
+            PathtoPublish: '$(System.DefaultWorkingDirectory)/target/$(Build.DefinitionName)-$(Build.BuildNumber).zip'
+            ArtifactName: 'build-$(Build.DefinitionName)'
+            publishLocation: 'Container'    
+
+  - stage: DOCKER_BUILD_PUSH_STAGE
+    pool:
+        name: wba-hsd
+        demands: Agent.ComputerName -equals xxxxxxxx
+    jobs:
+    - job: DOCKER_BUILD_PUSH_JOB
+      variables:
+        - group: kv-nprod
+        - name: appname
+          value: fhirinterceptor
+      steps:
+        - task: DownloadBuildArtifacts@0
+          enabled: "true"
+          inputs:
+           buildType: 'current'
+           downloadType: 'specific'
+           itemPattern: "build-$(Build.DefinitionName)/$(Build.DefinitionName)-$(Build.BuildNumber).zip"
+           downloadPath: "$(System.DefaultWorkingDirectory)"
+      
+        - task: ExtractFiles@1
+          inputs:
+           archiveFilePatterns: "build-$(Build.DefinitionName)/$(Build.DefinitionName)-$(Build.BuildNumber).zip"
+           destinationFolder: './target'
+           cleanDestinationFolder: true
+           overwriteExistingFiles: false
+
+        - script: 
+            sudo docker login $(containerRegistry) --username $(acrusername) --password $(acrpassword)
+            sudo docker build --build-arg jarFileName=$(appname)-$(Build.BuildId).jar -t $(containerRegistry)/$(appname):$(Build.BuildNumber) -t $(containerRegistry)/$(appname):latest . |
+            sudo docker push $(containerRegistry)/$(appname):$(Build.BuildNumber)
+            sudo docker push $(containerRegistry)/$(appname):latest
+          displayName: 'Push docker image'
+
+        - script: |
+            helmctl create -n $(appname)
+            cd $(system.defaultworkingdirectory)/$(appname)
+            export HELM_EXPERIMENTAL_OCI=1
+            helm registry login $(containerRegistry) --username $(acrusername) --password $(acrpassword)
+            helm chart save . $(containerRegistry)/$(appname)-helm:v1
+            helm chart push $(containerRegistry)/$(appname)-helm:v1
+          displayName: 'Create HELM Chart'
+
+- ${{ if eq(parameters.deploy, true) }}:
+  - stage: Deploy_Stage
+    jobs:
+    - job: HELM_INSTALLATION
+      variables:
+        - group: kv-nprod
+        - name:  appname
+          value: fhirinterceptor
+      pool:
+        name: wba-hsd
+        demands: Agent.ComputerName -equals aamhadagp1la001
+      workspace:
+        clean: all
+      steps:
+        - ${{ if eq(parameters.dryrun, true) }}:
+          - script: |
+              az login --service-principal --username $(acrusername) --tenant xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx --password $(acrpassword)
+              VAR="$(az acr repository show-manifests --name $(containerRegistry) --repository $(appname) --orderby time_desc --query [0].tags[0] --output tsv)"
+              export HELM_EXPERIMENTAL_OCI=1
+              helm registry login $(containerRegistry) --username $(acrusername) --password $(acrpassword)
+              helmctl load -n $(appname) -acr $(containerRegistry) -t $VAR -c $(cluster) -env $(environment)
+            displayName: 'Helm Load & Dry Run'
+        - ${{ if eq(parameters.install, true) }}:
+          - script: |
+              az login --service-principal --username $(acrusername) --tenant xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx --password $(acrpassword)
+              VAR="$(az acr repository show-manifests --name $(containerRegistry) --repository $(appname) --orderby time_desc --query [0].tags[0] --output tsv)"
+              export HELM_EXPERIMENTAL_OCI=1
+              helm registry login $(containerRegistry) --username $(acrusername) --password $(acrpassword)
+              helmctl load -n $(appname) -acr $(containerRegistry) -t $VAR -c $(cluster) -env $(environment)
+              helmctl install -n $(appname) -ns $(namespace) -c $(cluster) -env $(environment)
+            displayName: 'Helm Install'
